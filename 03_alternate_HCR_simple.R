@@ -280,17 +280,13 @@ inny<-rbind(cat_long,proj_long,obs_long)
 #========================
 # estimate yearly survival
 library(RTMB)
-
-# 1. PRE-SLICE YOUR DATA LIST OUTSIDE THE FUNCTION
-# Apply all row and column modifications here so the shapes match perfectly
-
-library(RTMB)
-
-# 1. PRE-SLICE YOUR DATA LIST OUTSIDE THE FUNCTION
-# Apply all row and column modifications here so the shapes match perfectly
-
+projection_years <- as.numeric(rownames(male_immature_cat_removed))
+projection_rows <- which(projection_years > 1990)
+obs_rows <- match(projection_years[projection_rows] + 1, as.numeric(rownames(all_male_obs)))
+fit_rows <- which(!is.na(obs_rows))
+fit_obs <- as.matrix(all_male_obs[obs_rows[fit_rows], 16:ncol(all_male_obs)])
 pars<-list(
-  proj_m=rep(log(0.3), nrow(fit_obs)),
+  proj_m=rep(log(0.3), length(projection_rows)),
   log_m_mu= -1.2,
   mu_sd= log(0.6)
 )
@@ -299,12 +295,13 @@ pars<-list(
 dat <- list(
   size_trans = size_trans,
   
-  # Pre-slice the input matrices to drop the last row so they align with fit_obs
-  male_immature_cat_removed = as.matrix(male_immature_cat_removed[which(rownames(male_immature_cat_removed) > 1990), ]),
-  male_mature_cat_removed   = as.matrix(male_mature_cat_removed[which(rownames(male_immature_cat_removed) > 1990), ]),
+  # Keep post-1990 projections; fit only those with a following-year survey.
+  male_immature_cat_removed = as.matrix(male_immature_cat_removed[projection_rows, ]),
+  male_mature_cat_removed   = as.matrix(male_mature_cat_removed[projection_rows, ]),
+  fit_rows = fit_rows,
   
   # Pre-slice fit_obs to only include columns 16 onwards
-  fit_obs = fit_obs[-1, 16:ncol(fit_obs)] 
+  fit_obs = fit_obs 
 )
 
 # 2. DEFINE THE CLEAN OBJECTIVE FUNCTION
@@ -334,10 +331,8 @@ small_pop_dy <- function(pars) {
   nll <- nll - sum(dnorm(proj_m, mean = log_m_mu, sd = exp(mu_sd), log = TRUE))
   
   # B. Numbers at Size Component
-  # Slicing the prediction matrix: drop the last row, and take columns 15+ to match fit_obs columns (16:ncol)
-  # (Note: since fit_obs was sliced from column 16 of the original matrix, 
-  # pred_matrix must take the matching columns 16 to ncol)
-  pred_matrix <- all_male_proj_fish[1:(nrow(all_male_proj_fish) - 1), 16:ncol(all_male_proj_fish)]
+  # Match each projection to its following-year survey and the same size bins.
+  pred_matrix <- all_male_proj_fish[fit_rows, 16:ncol(all_male_proj_fish), drop = FALSE]
   
   # Force both sides explicitly back to a tracked matrix structure to be safe
   log_res <- (as.matrix(fit_obs) + 1e-6) - (as.matrix(pred_matrix) + 1e-6)
@@ -357,6 +352,8 @@ obj <- MakeADFun(
 # 4. ESTIMATE PARAMETERS
 opt <- nlminb(obj$par, obj$fn, obj$gr)
 print(opt)
+obj$fn(opt$par)
+rep_values <- obj$report()
 
 library(ggplot2)
 
@@ -365,24 +362,24 @@ rep <- sdreport(obj)
 rep_rand  <- summary(rep, select = "random")
 rep_fixed <- summary(rep, select = "fixed")
 
-# 2. Extract the estimated log-mean and calculate its normal-scale value
-# (We grab the value from the row labeled "log_m_mu")
+# 2. Extract the fitted population mean on the log scale
 log_M_mean_est <- rep_fixed["log_m_mu", "Estimate"]
-M_mean_normal  <- exp(log_M_mean_est)
 
 # 3. Build the plotting dataset for the yearly random effects
 years <- as.numeric(rownames(dat$male_immature_cat_removed))
+yearly_rand <- rep_rand
 
 plot_data <- data.frame(
   Year  = years,
-  M_log = rep_rand[, "Estimate"],
-  SE    = rep_rand[, "Std. Error"]
+  M_log = yearly_rand[, "Estimate"],
+  SE    = yearly_rand[, "Std. Error"]
 )
 
 # 4. Transform log random effects to strictly positive normal space
 plot_data$M_est <- exp(plot_data$M_log)
 plot_data$lower <- exp(plot_data$M_log - 1.96 * plot_data$SE)
 plot_data$upper <- exp(plot_data$M_log + 1.96 * plot_data$SE)
+M_mean_normal <- mean(plot_data$M_est)
 
 # 5. Generate the ggplot with the average horizontal reference line
 est_m_plot<-ggplot(plot_data, aes(x = Year)) +
@@ -481,3 +478,30 @@ plot(mod,pages=1,too.far=1,scheme=2)
 #===========================================================================
 #==I need to keep shell condition in here so I can estimate mature mortality
 #==without confounding with immature mortality
+
+# Mortality over time: observed estimates and GAM fitted means with 95% intervals
+gam_plot_data <- in_dat
+gam_plot_data$Year <- as.numeric(as.character(gam_plot_data$Year))
+gam_plot_data <- gam_plot_data[order(gam_plot_data$Year), ]
+gam_prediction <- predict(mod, newdata = gam_plot_data, type = "link", se.fit = TRUE)
+gam_plot_data$predicted_mortality <- mod$family$linkinv(gam_prediction$fit)
+gam_plot_data$predicted_lower <- mod$family$linkinv(gam_prediction$fit - 1.96 * gam_prediction$se.fit)
+gam_plot_data$predicted_upper <- mod$family$linkinv(gam_prediction$fit + 1.96 * gam_prediction$se.fit)
+gam_plot_data$observed_lower <- 1 - exp(-gam_plot_data$lower)
+gam_plot_data$observed_upper <- 1 - exp(-gam_plot_data$upper)
+
+gam_mortality_plot <- ggplot(gam_plot_data, aes(x = Year, group = 1)) +
+  geom_ribbon(aes(ymin = predicted_lower, ymax = predicted_upper), fill = "skyblue", alpha = 0.4) +
+  geom_line(aes(y = predicted_mortality, color = "GAM prediction"), linewidth = 1) +
+  geom_errorbar(aes(ymin = observed_lower, ymax = observed_upper, color = "Observed estimate"), width = 0.2) +
+  geom_point(aes(y = mortality, color = "Observed estimate"), size = 2) +
+  geom_point(aes(y = predicted_mortality, color = "GAM prediction"), shape = 17, size = 2) +
+  scale_color_manual(values = c("GAM prediction" = "blue", "Observed estimate" = "black"), name = NULL) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "Year", y = "Mortality (1 - exp(-M))",
+       caption = "95% intervals: observed estimate error bars; GAM mean confidence band.") +
+  theme_bw()
+
+print(gam_mortality_plot)
+dir.create("plots", showWarnings = FALSE)
+ggsave("plots/gam_mortality_plot.png", gam_mortality_plot, width = 10, height = 6, dpi = 300)
